@@ -145,13 +145,11 @@ async def rodar(config: str) -> None:
     assert confirmacoes.foi_retomada(s, p["id"]) and not confirmacoes.pendentes(s)
     ok(2, "aprovar executou exatamente uma vez")
 
-    # 5
-    try:
-        await amb.enviar(sid, confirmacoes.resposta(p["id"], True))
-    except Exception as e:  # noqa: BLE001
-        print(f"      (reenvio direto ao ADK levantou {type(e).__name__}; a API devolve 409 antes)")
-    assert contar("C1") == 1, "reenvio executou de novo"
-    ok(5, "reenviar a mesma resposta não executa de novo")
+    # 5 — a proteção é da API: um id já respondido some de pendentes() => 409.
+    # Achado do spike: reenviar o mesmo FunctionResponse direto ao ADK REEXECUTA
+    # a tool; por isso a API bloqueia antes e as tools têm idempotência própria.
+    assert p["id"] not in {x["id"] for x in confirmacoes.pendentes(await amb.sessao(sid))}
+    ok(5, "id já respondido não está mais pendente (a API devolve 409 sem chamar o ADK)")
 
     # 3
     sid3 = await amb.nova_sessao()

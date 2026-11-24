@@ -13,7 +13,7 @@ load_dotenv(RAIZ / ".env")
 # Chave do Google AI Studio (não Vertex AI).
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "FALSE")
 
-MODELO_PADRAO = "gemini-2.5-flash"
+MODELO_PADRAO = "gemini-3.8-flash"
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or MODELO_PADRAO
 
 APP_NAME = "aurora"

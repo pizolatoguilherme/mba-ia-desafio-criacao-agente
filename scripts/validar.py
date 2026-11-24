@@ -147,6 +147,18 @@ def wp0_arquivos() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# WP1 — spike de confirmação (topologia e config do App)
+# --------------------------------------------------------------------------- #
+
+
+@checagem("wp1", "spike: confirmação com sessão SQLite, reinício e concorrência (config A)", requer="llm")
+def wp1_spike() -> None:
+    r = sh("uv", "run", "python", "scripts/spike_confirmacao.py", "--config", "A", ok=False)
+    afirmar(r.returncode == 0 and "todos os itens OK" in r.stdout,
+            f"spike falhou:\n{r.stdout[-1500:]}\n{r.stderr[-800:]}")
+
+
+# --------------------------------------------------------------------------- #
 # WP2 — camada de dados (banco temporário isolado, ver TMP_VAR)
 # --------------------------------------------------------------------------- #
 
