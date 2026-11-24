@@ -117,6 +117,37 @@ def inv_coordenador_sem_regulamento() -> None:
     afirmar("Capítulo" not in texto and "Art. " not in texto, "coordenador contém trecho do regulamento")
 
 
+REPO_ESCOPO_APTO = {"listar_reservas_ativas", "cancelar_reserva", "criar_reserva", "listar_visitantes",
+                    "autorizar_visitante"}
+ARQS_TOOLS_DADOS = ("reservas.py", "visitantes.py")
+
+
+def tools_que_usam_sessao(pasta: Path | None = None) -> dict[str, dict[str, bool]]:
+    """Por tool pública: chama função de repositório com escopo de apartamento? chama apartamento_da_sessao?"""
+    pasta = pasta or SRC / "tools"
+    out: dict[str, dict[str, bool]] = {}
+    for nome in ARQS_TOOLS_DADOS:
+        arq = pasta / nome
+        if not arq.exists():
+            continue
+        for no in ast.parse(arq.read_text(encoding="utf-8")).body:
+            if not isinstance(no, (ast.FunctionDef, ast.AsyncFunctionDef)) or no.name.startswith("_"):
+                continue
+            chamadas = [c.func for c in ast.walk(no) if isinstance(c, ast.Call)]
+            repo = any(isinstance(f, ast.Attribute) and f.attr in REPO_ESCOPO_APTO
+                       and isinstance(f.value, ast.Name) and f.value.id == "repositorio" for f in chamadas)
+            sessao = any(isinstance(f, ast.Name) and f.id == "apartamento_da_sessao" for f in chamadas)
+            out[no.name] = {"dados_apto": repo, "sessao": sessao}
+    return out
+
+
+@checagem("inv", "toda tool que acessa dados de apartamento obtém o apartamento da sessão")
+def inv_tools_de_dados_usam_sessao() -> None:
+    for nome, info in tools_que_usam_sessao().items():
+        afirmar(not info["dados_apto"] or info["sessao"],
+                f"tool {nome} acessa dados de apartamento sem apartamento_da_sessao(tool_context)")
+
+
 @checagem("inv", "instruções dos agentes sem referência a artigo concreto do regulamento")
 def inv_sem_artigo_concreto() -> None:
     pasta = SRC / "agents"
@@ -801,6 +832,17 @@ def wp7_trechos() -> None:
                 afirmar(l in intervalo, f"{arq}#L{ini}-L{fim}: trecho não encontrado nas linhas: {l!r}")
         total += 1
     afirmar(total >= 5, f"só {total} trechos verificáveis")
+
+
+@checagem("wp7", "README lista exatamente as tools que obtêm o apartamento da sessão (P-07)")
+def wp7_tools_da_sessao() -> None:
+    texto = (RAIZ / "README.md").read_text(encoding="utf-8")
+    afirmar("Todas chamam" not in texto, "README generaliza 'Todas chamam'")
+    m = re.search(r"Toda tool que lê ou grava dados de um apartamento \(([^)]*)\) obtém o apartamento por", texto)
+    afirmar(m is not None, "README sem a frase das tools que usam apartamento_da_sessao")
+    citadas = set(re.findall(r"`(\w+)`", m.group(1)))
+    reais = {n for n, i in tools_que_usam_sessao().items() if i["sessao"]}
+    afirmar(citadas == reais, f"README cita {sorted(citadas)}, código usa {sorted(reais)}")
 
 
 @checagem("wp7", "comandos do README existem no pyproject")

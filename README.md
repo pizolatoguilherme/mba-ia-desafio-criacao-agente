@@ -133,7 +133,7 @@ Cada garantia abaixo aponta o arquivo, as linhas e o trecho de código que a imp
           raise SessaoSemApartamento("Sessão sem apartamento válido; operação negada.")
       return do_banco
   ```
-- `src/aurora/tools/reservas.py`, `src/aurora/tools/visitantes.py`: **nenhuma tool tem parâmetro de apartamento**. Todas chamam `apartamento_da_sessao(tool_context)`, e o validador confere isso no código-fonte.
+- `src/aurora/tools/reservas.py`, `src/aurora/tools/visitantes.py`: **nenhuma tool tem parâmetro de apartamento**. Toda tool que lê ou grava dados de um apartamento (`listar_minhas_reservas`, `cancelar_reserva`, `reservar_area`, `listar_meus_visitantes`, `autorizar_visitante`) obtém o apartamento por `apartamento_da_sessao(tool_context)`. `listar_areas` e `verificar_disponibilidade` não usam apartamento: a lista de áreas é pública e a disponibilidade devolve só livre ou ocupada. O validador confere isso no código-fonte.
 - `src/aurora/repositorio.py` · `listar_reservas_ativas`, `cancelar_reserva`, `listar_visitantes`: filtram por `WHERE apartamento = ?`. Quando a reserva não é do apartamento, `cancelar_reserva` responde com uma mensagem genérica.
 - `src/aurora/repositorio.py` · `area_livre`: consulta a agenda da área, ou seja, as reservas de todas as unidades, como o enunciado permite. Devolve só `True`/`False`, sem dono nem código.
 
