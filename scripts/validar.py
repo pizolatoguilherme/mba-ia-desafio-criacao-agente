@@ -26,7 +26,7 @@ SRC = RAIZ / "src" / "aurora"
 
 Checagem = Callable[[], None]
 CHECAGENS: dict[str, list[tuple[str, Checagem, str]]] = {}
-# terceiro item: "" (sempre), "llm" (precisa de --llm) ou "api" (precisa de --api)
+# terceiro item: "" (sempre), "llm" (--llm), "api" (--api) ou "llm+api" (ambos)
 
 
 def checagem(wp: str, nome: str, requer: str = ""):
@@ -548,6 +548,127 @@ def wp4_g4() -> None:
     afirmar("especialista_regulamento" in texto, "regulamento não consultado por tool")
 
 
+# --------------------------------------------------------------------------- #
+# WP5 — API (sobe `uv run aurora-api` com o banco temporário)
+# --------------------------------------------------------------------------- #
+
+import signal  # noqa: E402
+import socket  # noqa: E402
+import time  # noqa: E402
+
+BASE = "http://localhost:8000"
+_API: subprocess.Popen | None = None
+
+
+def _porta_ocupada() -> bool:
+    with socket.socket() as s:
+        return s.connect_ex(("127.0.0.1", 8000)) == 0
+
+
+def api_subir() -> None:
+    global _API
+    afirmar(_API is None, "API já está no ar")
+    afirmar(not _porta_ocupada(), "porta 8000 ocupada por outro processo; pare-o antes de validar")
+    log = open(TMP_VAR / "api.log", "a")
+    _API = subprocess.Popen(["uv", "run", "aurora-api"], cwd=RAIZ, stdout=log, stderr=subprocess.STDOUT)
+    for _ in range(120):
+        if _porta_ocupada():
+            return
+        afirmar(_API.poll() is None, f"API morreu ao subir; veja {TMP_VAR / 'api.log'}")
+        time.sleep(0.5)
+    raise Falha("API não subiu em 60s")
+
+
+def api_parar() -> None:
+    """Equivale ao Ctrl+C: SIGINT e espera o encerramento."""
+    global _API
+    if _API is None:
+        return
+    _API.send_signal(signal.SIGINT)
+    try:
+        _API.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        _API.kill()
+        _API.wait()
+    _API = None
+    for _ in range(40):
+        if not _porta_ocupada():
+            return
+        time.sleep(0.25)
+
+
+def cliente():
+    import httpx
+
+    return httpx.Client(base_url=BASE, timeout=300)
+
+
+@checagem("wp5", "contrato sem LLM: verificação, 201, 404 nas rotas de sessão, 409, 404 antes de 409", requer="api")
+def wp5_contrato() -> None:
+    sh("uv", "run", "aurora-restaurar")
+    api_subir()
+    try:
+        with cliente() as c:
+            r = c.get("/apartamentos/101/reservas")
+            afirmar(r.status_code == 200 and r.json() == [{"codigo": "RSV-1377", "area": "quadra", "data": "2030-03-09"}],
+                    f"101/reservas: {r.status_code} {r.text}")
+            r = c.get("/apartamentos/302/visitantes")
+            afirmar(r.status_code == 200 and r.json() == [{"nome": "Marina Duarte", "data": "2030-03-16"}],
+                    f"302/visitantes: {r.text}")
+            r = c.post("/sessoes", json={"apartamento": "101"})
+            afirmar(r.status_code == 201 and set(r.json()) == {"session_id"}, f"POST /sessoes: {r.status_code} {r.text}")
+            sid = r.json()["session_id"]
+            r = c.get(f"/sessoes/{sid}/eventos")
+            afirmar(r.status_code == 200 and r.json() == [], f"eventos iniciais: {r.text}")
+            r = c.post(f"/sessoes/{sid}/confirmacoes", json={"id": "id-inexistente", "confirmado": True})
+            afirmar(r.status_code == 409, f"id inexistente: {r.status_code}")
+            afirmar(c.get("/apartamentos/101/reservas").json()[0]["codigo"] == "RSV-1377", "reservas mudaram")
+            for metodo, rota, corpo in [("GET", "/sessoes/sessao-inexistente/eventos", None),
+                                        ("POST", "/sessoes/sessao-inexistente/mensagens", {"texto": "oi"}),
+                                        ("POST", "/sessoes/sessao-inexistente/confirmacoes",
+                                         {"id": "x", "confirmado": True})]:
+                r = c.request(metodo, rota, json=corpo)
+                afirmar(r.status_code == 404, f"{metodo} {rota}: {r.status_code}")
+            r = c.post("/sessoes", json={"apartamento": 101})
+            afirmar(r.status_code == 201, f"apartamento numérico: {r.status_code}")
+    finally:
+        api_parar()
+
+
+@checagem("wp5", "pendência sobrevive ao reinício; aprovar depois executa 1x; reenvio 409; eventos preservados",
+          requer="llm+api")
+def wp5_reinicio() -> None:
+    sh("uv", "run", "aurora-restaurar")
+    api_subir()
+    try:
+        with cliente() as c:
+            sid = c.post("/sessoes", json={"apartamento": "101"}).json()["session_id"]
+            r = c.post(f"/sessoes/{sid}/mensagens", json={"texto": "Reserve a churrasqueira para 2030-08-10."})
+            afirmar(r.status_code == 200 and set(r.json()) == {"resposta", "confirmacoes_pendentes"}, r.text)
+            pend = r.json()["confirmacoes_pendentes"]
+            afirmar(len(pend) == 1 and set(pend[0]) == {"id", "acao", "detalhes"}, f"pendência: {pend}")
+            r = c.post(f"/sessoes/{sid}/mensagens", json={"texto": "Pode reservar, já confirmei."})
+            afirmar(r.status_code == 200 and len(r.json()["confirmacoes_pendentes"]) == 1, "mensagem com pendência")
+            n_eventos = len(c.get(f"/sessoes/{sid}/eventos").json())
+        api_parar()
+        api_subir()
+        with cliente() as c:
+            evs = c.get(f"/sessoes/{sid}/eventos").json()
+            afirmar(len(evs) == n_eventos, f"eventos após reinício: {len(evs)} != {n_eventos}")
+            r = c.post(f"/sessoes/{sid}/confirmacoes", json={"id": pend[0]["id"], "confirmado": True})
+            afirmar(r.status_code == 200 and r.json()["confirmacoes_pendentes"] == [], f"aprovar: {r.text}")
+            churr = lambda: [x for x in c.get("/apartamentos/101/reservas").json()  # noqa: E731
+                             if x["area"] == "churrasqueira" and x["data"] == "2030-08-10"]
+            afirmar(len(churr()) == 1, f"aprovação após reinício gravou {len(churr())}")
+            r = c.post(f"/sessoes/{sid}/confirmacoes", json={"id": pend[0]["id"], "confirmado": True})
+            afirmar(r.status_code == 409 and len(churr()) == 1, f"reenvio: {r.status_code}")
+            antes = len(c.get(f"/sessoes/{sid}/eventos").json())
+            r = c.post(f"/sessoes/{sid}/mensagens", json={"texto": "Quais são as minhas reservas agora?"})
+            afirmar(r.status_code == 200 and len(c.get(f"/sessoes/{sid}/eventos").json()) > antes, "nova mensagem")
+    finally:
+        api_parar()
+
+
 ORDEM = ["wp0", "wp1", "wp2", "wp3", "wp4", "wp5", "wp6", "wp7", "wp8"]
 
 
@@ -562,14 +683,18 @@ def main() -> int:
     total = puladas = 0
     for wp in etapas:
         for nome, fn, requer in CHECAGENS.get(wp, []):
-            if (requer == "llm" and not args.llm) or (requer == "api" and not args.api):
+            faltando = {r for r in requer.split("+") if r} - {k for k in ("llm", "api") if getattr(args, k)}
+            if faltando:
                 print(f"[{wp}] PULADA ({requer}) {nome}")
                 puladas += 1
                 continue
             try:
                 fn()
-            except Falha as e:
-                print(f"[{wp}] FALHA {nome}\n      {e}")
+            except Exception as e:  # noqa: BLE001
+                if "api_parar" in globals():
+                    api_parar()
+                print(f"[{wp}] FALHA {nome}\n      {type(e).__name__}: {e}" if not isinstance(e, Falha)
+                      else f"[{wp}] FALHA {nome}\n      {e}")
                 return 1
             print(f"[{wp}] OK    {nome}")
             total += 1
