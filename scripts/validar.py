@@ -117,6 +117,16 @@ def inv_coordenador_sem_regulamento() -> None:
     afirmar("Capítulo" not in texto and "Art. " not in texto, "coordenador contém trecho do regulamento")
 
 
+@checagem("inv", "instruções dos agentes sem referência a artigo concreto do regulamento")
+def inv_sem_artigo_concreto() -> None:
+    pasta = SRC / "agents"
+    if not pasta.exists():
+        return
+    for arq in pasta.glob("*.py"):
+        achado = re.search(r"Art\.\s*\d+", arq.read_text(encoding="utf-8"))
+        afirmar(achado is None, f"{arq.name} cita '{achado.group(0) if achado else ''}'")
+
+
 # --------------------------------------------------------------------------- #
 # WP0 — projeto
 # --------------------------------------------------------------------------- #
@@ -570,8 +580,9 @@ def api_subir(cwd: Path | None = None, env: dict | None = None) -> None:
     afirmar(_API is None, "API já está no ar")
     afirmar(not _porta_ocupada(), "porta 8000 ocupada por outro processo; pare-o antes de validar")
     log = open(TMP_VAR / "api.log", "a")
+    # Grupo de processos próprio: o "Ctrl+C" abaixo vai para o grupo inteiro, como no terminal.
     _API = subprocess.Popen(["uv", "run", "aurora-api"], cwd=cwd or RAIZ, env=env,
-                            stdout=log, stderr=subprocess.STDOUT)
+                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(120):
         if _porta_ocupada():
             return
@@ -585,12 +596,13 @@ def api_parar() -> None:
     global _API
     if _API is None:
         return
-    _API.send_signal(signal.SIGINT)
+    os.killpg(_API.pid, signal.SIGINT)  # Ctrl+C: SIGINT ao grupo (uv + python)
     try:
         _API.wait(timeout=30)
     except subprocess.TimeoutExpired:
-        _API.kill()
+        os.killpg(_API.pid, signal.SIGKILL)
         _API.wait()
+        raise Falha("API não encerrou com Ctrl+C (SIGINT) em 30s")
     _API = None
     for _ in range(40):
         if not _porta_ocupada():
@@ -632,6 +644,13 @@ def wp5_contrato() -> None:
                 afirmar(r.status_code == 404, f"{metodo} {rota}: {r.status_code}")
             r = c.post("/sessoes", json={"apartamento": 101})
             afirmar(r.status_code == 201, f"apartamento numérico: {r.status_code}")
+        # P-06: localhost pode resolver para ::1; a API precisa responder nos dois loopbacks
+        for url in ("http://127.0.0.1:8000/apartamentos/101/reservas", "http://[::1]:8000/apartamentos/101/reservas"):
+            if url.startswith("http://[") and "00000000000000000000000000000001" not in Path("/proc/net/if_inet6").read_text():
+                continue  # máquina sem IPv6 de loopback
+            import httpx
+            r = httpx.get(url, timeout=10)
+            afirmar(r.status_code == 200, f"{url}: {r.status_code}")
     finally:
         api_parar()
 
@@ -656,6 +675,12 @@ def wp5_reinicio() -> None:
         with cliente() as c:
             evs = c.get(f"/sessoes/{sid}/eventos").json()
             afirmar(len(evs) == n_eventos, f"eventos após reinício: {len(evs)} != {n_eventos}")
+            # P-01: cada evento traz todos os campos do Event do ADK (inclusive os nulos)
+            from google.adk.events import Event
+
+            esperado = set(Event(author="x").model_dump(mode="json", by_alias=True))
+            faltando = [sorted(esperado - set(e)) for e in evs if esperado - set(e)]
+            afirmar(not faltando, f"eventos sem campos completos: {faltando[:1]}")
             r = c.post(f"/sessoes/{sid}/confirmacoes", json={"id": pend[0]["id"], "confirmado": True})
             afirmar(r.status_code == 200 and r.json()["confirmacoes_pendentes"] == [], f"aprovar: {r.text}")
             churr = lambda: [x for x in c.get("/apartamentos/101/reservas").json()  # noqa: E731

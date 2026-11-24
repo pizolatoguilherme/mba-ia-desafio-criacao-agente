@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import socket
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -96,8 +97,38 @@ async def visitantes_do_apartamento(numero: str) -> list[dict[str, str]]:
     return repositorio.listar_visitantes(numero)
 
 
+PORTA = 8000
+
+
+def _socket_loopback(familia: socket.AddressFamily, endereco: str) -> socket.socket:
+    s = socket.socket(familia, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if familia == socket.AF_INET6:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    s.bind((endereco, PORTA))
+    s.set_inheritable(True)
+    return s
+
+
 def main() -> None:
-    uvicorn.run("aurora.api:app", host="127.0.0.1", port=8000, workers=1)
+    """Sobe a API em http://localhost:8000, escutando em 127.0.0.1 e em ::1.
+
+    `localhost` pode resolver para IPv4 ou IPv6 conforme a máquina; com os dois
+    sockets de loopback a API responde em ambos, sem se expor fora da máquina.
+    """
+    sockets = [_socket_loopback(socket.AF_INET, "127.0.0.1")]
+    try:
+        sockets.append(_socket_loopback(socket.AF_INET6, "::1"))
+    except OSError as e:  # máquina sem IPv6: segue só com IPv4
+        logging.getLogger("aurora.api").warning("IPv6 de loopback indisponível (%s); só 127.0.0.1", e)
+    servidor = uvicorn.Server(uvicorn.Config("aurora.api:app", port=PORTA, workers=1))
+    try:
+        servidor.run(sockets=sockets)
+    except KeyboardInterrupt:  # Ctrl+C: encerramento normal (como em uvicorn.run)
+        pass
+    finally:
+        for s in sockets:
+            s.close()
 
 
 if __name__ == "__main__":

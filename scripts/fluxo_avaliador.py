@@ -201,7 +201,7 @@ def p12(s1) -> int:
     r = msg(s1, "Até que horas a piscina funciona aos domingos?")
     afirmar(re.search(r"\b20\s?h", r["resposta"]) is not None, f"sem 20h: {r['resposta']!r}")
     evs = eventos(s1)
-    chamadas = {p["functionCall"]["name"] for e in evs for p in (e.get("content") or {}).get("parts", [])
+    chamadas = {p["functionCall"]["name"] for e in evs for p in ((e.get("content") or {}).get("parts") or [])
                 if p.get("functionCall")}
     afirmar({"cancelar_reserva", "reservar_area", "autorizar_visitante"} <= chamadas,
             f"chamadas de tool ausentes nos eventos: {chamadas}")

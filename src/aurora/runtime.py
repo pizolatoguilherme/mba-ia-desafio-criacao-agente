@@ -82,7 +82,7 @@ class Assistente:
 
     async def eventos(self, session_id: str) -> list[dict[str, Any]]:
         _, s = await self.sessao(session_id)
-        return [e.model_dump(mode="json", by_alias=True, exclude_none=True) for e in s.events]
+        return [e.model_dump(mode="json", by_alias=True) for e in s.events]
 
     # ------------------------------------------------------------------ conversa
 
