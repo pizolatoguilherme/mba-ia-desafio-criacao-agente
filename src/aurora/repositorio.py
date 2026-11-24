@@ -8,6 +8,7 @@ responde apenas se a data está livre.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from typing import Any
@@ -86,16 +87,34 @@ def area_livre(area_id: str, data: str) -> bool:
     return r is None
 
 
+def _ja_executada(con: sqlite3.Connection, chave: str | None) -> dict[str, Any] | None:
+    if not chave:
+        return None
+    r = con.execute("SELECT resultado FROM acoes_executadas WHERE chave = ?", (chave,)).fetchone()
+    return json.loads(r["resultado"]) if r else None
+
+
+def _registrar_execucao(con: sqlite3.Connection, chave: str | None, resultado: dict[str, Any]) -> None:
+    if chave:
+        con.execute(
+            "INSERT INTO acoes_executadas (chave, resultado, executada_em) VALUES (?, ?, ?)",
+            (chave, json.dumps(resultado, ensure_ascii=False), db.agora()),
+        )
+
+
 def _novo_codigo() -> str:
     return f"RSV-{uuid.uuid4().hex[:6].upper()}"
 
 
-def criar_reserva(apartamento: str, area_id: str, data: str) -> dict[str, Any]:
+def criar_reserva(
+    apartamento: str, area_id: str, data: str, *, chave_idempotencia: str | None = None
+) -> dict[str, Any]:
     """Grava a reserva. A exclusividade vale no INSERT (índice ux_reserva_ativa).
 
     Não depende de conferência prévia: se outra reserva ativa para a mesma área
     e data entrar antes, o SQLite recusa este INSERT e a função devolve
-    ``indisponivel`` como resposta normal.
+    ``indisponivel`` como resposta normal. Com ``chave_idempotencia`` (id da
+    chamada de tool aprovada), uma reexecução devolve o resultado já gravado.
     """
     info = area(area_id)
     if info is None:
@@ -105,6 +124,8 @@ def criar_reserva(apartamento: str, area_id: str, data: str) -> dict[str, Any]:
         codigo = _novo_codigo()
         try:
             with db.transacao() as con:
+                if (anterior := _ja_executada(con, chave_idempotencia)) is not None:
+                    return anterior
                 # PK de codigos_reserva: código nunca repete, nem de reserva cancelada.
                 con.execute("INSERT INTO codigos_reserva (codigo) VALUES (?)", (codigo,))
                 con.execute(
@@ -112,6 +133,14 @@ def criar_reserva(apartamento: str, area_id: str, data: str) -> dict[str, Any]:
                     "VALUES (?, ?, ?, ?, ?, 'ativa', ?)",
                     (codigo, apartamento, area_id, data, valor, db.agora()),
                 )
+                resultado = {
+                    "status": "reservado",
+                    "codigo": codigo,
+                    "area": area_id,
+                    "data": data,
+                    "valor_cobranca": valor,
+                }
+                _registrar_execucao(con, chave_idempotencia, resultado)
         except sqlite3.IntegrityError as e:
             msg = str(e)
             if "codigos_reserva.codigo" in msg:
@@ -119,13 +148,7 @@ def criar_reserva(apartamento: str, area_id: str, data: str) -> dict[str, Any]:
             if "reservas.area" in msg or "reservas.data" in msg:
                 return {"status": "indisponivel", "area": area_id, "data": data}
             raise
-        return {
-            "status": "reservado",
-            "codigo": codigo,
-            "area": area_id,
-            "data": data,
-            "valor_cobranca": valor,
-        }
+        return resultado
     raise RuntimeError("não foi possível gerar um código de reserva único")
 
 
@@ -171,10 +194,16 @@ def listar_visitantes(apartamento: str) -> list[dict[str, str]]:
     return [{"nome": r["nome"], "data": r["data"]} for r in linhas]
 
 
-def autorizar_visitante(apartamento: str, nome: str, data: str) -> dict[str, Any]:
+def autorizar_visitante(
+    apartamento: str, nome: str, data: str, *, chave_idempotencia: str | None = None
+) -> dict[str, Any]:
     with db.transacao() as con:
+        if (anterior := _ja_executada(con, chave_idempotencia)) is not None:
+            return anterior
         con.execute(
             "INSERT OR IGNORE INTO visitantes (apartamento, nome, data, criado_em) VALUES (?, ?, ?, ?)",
             (apartamento, nome, data, db.agora()),
         )
-    return {"status": "autorizado", "nome": nome, "data": data}
+        resultado = {"status": "autorizado", "nome": nome, "data": data}
+        _registrar_execucao(con, chave_idempotencia, resultado)
+    return resultado

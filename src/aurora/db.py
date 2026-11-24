@@ -66,6 +66,14 @@ CREATE TABLE IF NOT EXISTS sessoes (
     criada_em   TEXT NOT NULL
 );
 
+-- Ações confirmadas já executadas, por id da chamada de tool. Reexecutar a mesma
+-- chamada aprovada devolve o resultado anterior em vez de agir de novo.
+CREATE TABLE IF NOT EXISTS acoes_executadas (
+    chave       TEXT PRIMARY KEY,
+    resultado   TEXT NOT NULL,
+    executada_em TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     chave TEXT PRIMARY KEY,
     valor TEXT NOT NULL
