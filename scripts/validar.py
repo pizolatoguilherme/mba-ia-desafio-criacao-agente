@@ -565,12 +565,13 @@ def _porta_ocupada() -> bool:
         return s.connect_ex(("127.0.0.1", 8000)) == 0
 
 
-def api_subir() -> None:
+def api_subir(cwd: Path | None = None, env: dict | None = None) -> None:
     global _API
     afirmar(_API is None, "API já está no ar")
     afirmar(not _porta_ocupada(), "porta 8000 ocupada por outro processo; pare-o antes de validar")
     log = open(TMP_VAR / "api.log", "a")
-    _API = subprocess.Popen(["uv", "run", "aurora-api"], cwd=RAIZ, stdout=log, stderr=subprocess.STDOUT)
+    _API = subprocess.Popen(["uv", "run", "aurora-api"], cwd=cwd or RAIZ, env=env,
+                            stdout=log, stderr=subprocess.STDOUT)
     for _ in range(120):
         if _porta_ocupada():
             return
@@ -669,6 +670,172 @@ def wp5_reinicio() -> None:
         api_parar()
 
 
+# --------------------------------------------------------------------------- #
+# WP6 — fluxo completo do avaliador, 3 vezes, com reinício real da API
+# --------------------------------------------------------------------------- #
+
+REPETICOES_FLUXO = 3
+
+
+def _fluxo(fase: str) -> None:
+    r = sh("uv", "run", "python", "scripts/fluxo_avaliador.py", fase, ok=False)
+    log = TMP_VAR / "fluxo.log"
+    with open(log, "a") as f:
+        f.write(r.stdout + r.stderr)
+    afirmar(r.returncode == 0 and "FLUXO OK" in r.stdout,
+            f"fluxo {fase} falhou (log em {log}):\n" + "\n".join(r.stdout.splitlines()[-12:]))
+
+
+@checagem("wp6", f"fluxo do avaliador (passos 1–14) verde {REPETICOES_FLUXO}x seguidas com reinício real",
+          requer="llm+api")
+def wp6_fluxo() -> None:
+    for i in range(1, REPETICOES_FLUXO + 1):
+        sh("uv", "run", "aurora-restaurar")
+        api_subir()
+        try:
+            _fluxo("--ate-12")
+        finally:
+            api_parar()  # Ctrl+C
+        api_subir()      # mesmo comando, sem restaurar
+        try:
+            _fluxo("--pos-reinicio")
+        finally:
+            api_parar()
+        print(f"      execução {i}/{REPETICOES_FLUXO} OK")
+
+
+# --------------------------------------------------------------------------- #
+# WP7 — README
+# --------------------------------------------------------------------------- #
+
+
+def _secao(texto: str, titulo: str) -> str:
+    m = re.search(rf"^## {titulo}\s*$(.*?)(?=^## |\Z)", texto, re.MULTILINE | re.DOTALL)
+    afirmar(m is not None, f"README sem a seção '## {titulo}'")
+    return m.group(1)
+
+
+@checagem("wp7", "README com Arquitetura, Garantias e Como rodar")
+def wp7_secoes() -> None:
+    texto = (RAIZ / "README.md").read_text(encoding="utf-8")
+    afirmar("Regra é regra" not in texto, "README ainda é o enunciado")
+    for t in ("Arquitetura", "Garantias", "Como rodar"):
+        _secao(texto, t)
+    garantias = _secao(texto, "Garantias")
+    for n in range(1, 6):
+        afirmar(re.search(rf"^### {n}\. ", garantias, re.MULTILINE), f"Garantia {n} sem subseção")
+    rodar = _secao(texto, "Como rodar")
+    for cmd in ("uv sync", "uv run aurora-restaurar", "uv run aurora-api", "GOOGLE_API_KEY", "GEMINI_MODEL"):
+        afirmar(cmd in rodar, f"Como rodar sem '{cmd}'")
+
+
+@checagem("wp7", "cada arquivo e trecho citado na seção Garantias existe no código")
+def wp7_referencias() -> None:
+    texto = (RAIZ / "README.md").read_text(encoding="utf-8")
+    garantias = _secao(texto, "Garantias")
+    refs = 0
+    for linha in garantias.splitlines():
+        arquivos = re.findall(r"`(src/[\w/]+\.py)`", linha)
+        if not arquivos:
+            continue
+        conteudo = ""
+        for a in arquivos:
+            afirmar((RAIZ / a).is_file(), f"arquivo citado não existe: {a}")
+            conteudo += (RAIZ / a).read_text(encoding="utf-8")
+        _, sep, resto = linha.partition("·")
+        if not sep:
+            continue
+        simbolos = re.findall(r"`([A-Za-z_][\w.]*)`", resto.split(":", 1)[0])
+        for s in simbolos:
+            afirmar(s.split(".")[-1] in conteudo, f"'{s}' não encontrado em {arquivos}")
+            refs += 1
+    afirmar(refs >= 15, f"poucas referências verificáveis: {refs}")
+    for link in re.findall(r"\]\(((?:src|scripts)/[^)#]+)\)", texto):
+        afirmar((RAIZ / link).exists(), f"link quebrado: {link}")
+
+
+@checagem("wp7", "comandos do README existem no pyproject")
+def wp7_comandos() -> None:
+    scripts = tomllib.loads((RAIZ / "pyproject.toml").read_text())["project"]["scripts"]
+    afirmar(scripts.get("aurora-api") == "aurora.api:main", f"aurora-api: {scripts}")
+    afirmar(scripts.get("aurora-restaurar") == "aurora.restaurar:main", f"aurora-restaurar: {scripts}")
+
+
+# --------------------------------------------------------------------------- #
+# WP8 — auditoria final (passo 15) e clone limpo
+# --------------------------------------------------------------------------- #
+
+
+@checagem("wp8", "auditoria do passo 15: especialistas, tools de dados, regulamento fora do coordenador")
+def wp8_auditoria() -> None:
+    from aurora.agents.coordenador import coordenador
+
+    afirmar(len(coordenador.sub_agents) + len(coordenador.tools) >= 2, "menos de 2 especialistas")
+    nomes_tools = {getattr(t, "__name__", getattr(t, "name", "")) for a in coordenador.sub_agents for t in a.tools}
+    for t in ("reservar_area", "cancelar_reserva", "listar_minhas_reservas", "autorizar_visitante",
+              "listar_meus_visitantes"):
+        afirmar(t in nomes_tools, f"tool {t} ausente dos especialistas")
+    instr = coordenador.instruction if isinstance(coordenador.instruction, str) else ""
+    afirmar("Capítulo" not in instr and "Art." not in instr and len(instr) < 3000, "regulamento no coordenador")
+    db_txt = (SRC / "db.py").read_text()
+    afirmar("CREATE UNIQUE INDEX IF NOT EXISTS ux_reserva_ativa" in db_txt and "WHERE status = 'ativa'" in db_txt,
+            "índice de exclusividade ausente")
+
+
+def _env_limpo() -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in ("AURORA_DB", "SESSOES_DB", "VIRTUAL_ENV")}
+    return env
+
+
+@checagem("wp8", "tudo commitado e .env fora do Git")
+def wp8_commitado() -> None:
+    pend = sh("git", "status", "--porcelain").stdout.strip()
+    afirmar(pend == "", f"há mudanças não commitadas:\n{pend}")
+
+
+@checagem("wp8", "clone limpo + só o README: uv sync, restaurar, subir e fluxo 1–14 com reinício",
+          requer="llm+api")
+def wp8_clone_limpo() -> None:
+    clone = Path(tempfile.mkdtemp(prefix="aurora-clone-")) / "repo"
+    sh("git", "clone", "-q", str(RAIZ), str(clone))
+    afirmar(not (clone / ".env").exists(), ".env veio no clone")
+    afirmar((clone / ".env.example").exists(), ".env.example ausente no clone")
+    # passo 1 do avaliador: copia .env.example para .env e preenche a chave
+    chave = next(l for l in (RAIZ / ".env").read_text().splitlines() if l.startswith("GOOGLE_API_KEY="))
+    (clone / ".env").write_text((clone / ".env.example").read_text().replace("GOOGLE_API_KEY=", chave))
+    env = _env_limpo()
+
+    def run(*cmd):
+        r = subprocess.run(cmd, cwd=clone, env=env, capture_output=True, text=True)
+        afirmar(r.returncode == 0, f"{' '.join(cmd)} no clone falhou:\n{(r.stdout + r.stderr)[-1500:]}")
+        return r
+
+    run("uv", "sync")
+    for arq in (RAIZ / "dados").iterdir():  # dados/ do repo já é comparado ao upstream nos invariantes
+        afirmar((clone / "dados" / arq.name).read_bytes() == arq.read_bytes(), f"dados/{arq.name} difere no clone")
+    run("uv", "run", "aurora-restaurar")
+    api_subir(clone, env)
+    try:
+        r = run("uv", "run", "python", "scripts/fluxo_avaliador.py", "--ate-12")
+        afirmar("FLUXO OK" in r.stdout, r.stdout[-800:])
+    finally:
+        api_parar()
+    api_subir(clone, env)
+    try:
+        r = run("uv", "run", "python", "scripts/fluxo_avaliador.py", "--pos-reinicio")
+        afirmar("FLUXO OK" in r.stdout, r.stdout[-800:])
+    finally:
+        api_parar()
+
+
+@checagem("wp8", "main local enviada ao fork público (origin/main == HEAD)", requer="remoto")
+def wp8_push() -> None:
+    sh("git", "fetch", "-q", "origin")
+    head = sh("git", "rev-parse", "HEAD").stdout.strip()
+    remoto = sh("git", "rev-parse", "origin/main").stdout.strip()
+    afirmar(head == remoto, f"origin/main ({remoto[:7]}) != HEAD ({head[:7]})")
+
+
 ORDEM = ["wp0", "wp1", "wp2", "wp3", "wp4", "wp5", "wp6", "wp7", "wp8"]
 
 
@@ -677,13 +844,14 @@ def main() -> int:
     ap.add_argument("--ate", default="wp8", choices=ORDEM)
     ap.add_argument("--llm", action="store_true", help="inclui checagens que chamam o modelo")
     ap.add_argument("--api", action="store_true", help="inclui checagens contra a API no ar")
+    ap.add_argument("--remoto", action="store_true", help="confere o push para o fork")
     args = ap.parse_args()
 
     etapas = ["inv"] + ORDEM[: ORDEM.index(args.ate) + 1]
     total = puladas = 0
     for wp in etapas:
         for nome, fn, requer in CHECAGENS.get(wp, []):
-            faltando = {r for r in requer.split("+") if r} - {k for k in ("llm", "api") if getattr(args, k)}
+            faltando = {r for r in requer.split("+") if r} - {k for k in ("llm", "api", "remoto") if getattr(args, k)}
             if faltando:
                 print(f"[{wp}] PULADA ({requer}) {nome}")
                 puladas += 1
