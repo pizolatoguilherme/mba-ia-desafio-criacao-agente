@@ -60,14 +60,52 @@ O padrão é `gemini-3.8-flash`. O `gemini-2.5-flash` não está mais disponíve
 
 ## Garantias
 
-Cada garantia abaixo aponta o arquivo e o trecho que a implementam. Todas são verificadas por [scripts/validar.py](scripts/validar.py) e pelo fluxo do avaliador em [scripts/fluxo_avaliador.py](scripts/fluxo_avaliador.py).
+Cada garantia abaixo aponta o arquivo, as linhas e o trecho de código que a implementam. Nos trechos, `...` marca linhas omitidas. Todas são verificadas por [scripts/validar.py](scripts/validar.py), que também confere se cada trecho existe nas linhas indicadas, e pelo fluxo do avaliador em [scripts/fluxo_avaliador.py](scripts/fluxo_avaliador.py).
 
 ### 1. Cobrança ou acesso só com confirmação
 
 - `src/aurora/tools/reservas.py` · `reservar_area`: se a área tem taxa > 0, chama `tool_context.request_confirmation(...)` e devolve `aguardando_confirmacao_do_sistema` sem gravar. Só grava quando `tool_context.tool_confirmation` chega com `confirmed=True`. Com `confirmed=False`, não grava nada. Área com taxa 0 grava direto, sem confirmação.
+
+  [src/aurora/tools/reservas.py#L95-L115](src/aurora/tools/reservas.py#L95-L115)
+  ```python
+  confirmacao = tool_context.tool_confirmation
+  if confirmacao is None:
+      ...
+      if info["taxa"] > 0:
+          tool_context.request_confirmation(
+          ...
+      return repositorio.criar_reserva(apartamento, area_id, dia)
+
+  if not confirmacao.confirmed:
+      return {"status": "recusado_pelo_morador", "area": area_id, "data": dia,
+      ...
+  resultado = repositorio.criar_reserva(apartamento, area_id, dia,
+                                        chave_idempotencia=chave_idempotencia(tool_context))
+  ```
 - `src/aurora/tools/visitantes.py` · `autorizar_visitante`: **sempre** chama `request_confirmation`, porque liberar acesso exige confirmação, e grava só com `confirmed=True`.
+
+  [src/aurora/tools/visitantes.py#L42-L54](src/aurora/tools/visitantes.py#L42-L54)
+  ```python
+  confirmacao = tool_context.tool_confirmation
+  if confirmacao is None:
+      tool_context.request_confirmation(
+          hint=f"Autorizar a entrada de {nome} em {dia}.",
+          payload={"acao": "autorizar_visitante", "nome": nome, "data": dia},
+      )
+      ...
+  if not confirmacao.confirmed:
+      ...
+  return repositorio.autorizar_visitante(apartamento, nome, dia,
+                                         chave_idempotencia=chave_idempotencia(tool_context))
+  ```
 - `src/aurora/confirmacoes.py` · `pendentes`, `resposta`: as pendências são derivadas dos eventos persistidos (`adk_request_confirmation` sem resposta). `resposta` monta o `FunctionResponse` que retoma a tool.
 - `src/aurora/runtime.py` · `responder_confirmacao`, `ConfirmacaoNaoPendente`, `enviar_texto`: só aceita um id que esteja em `pendentes()` **daquela sessão**. Qualquer outro id (inexistente, já respondido ou de outra sessão) gera `ConfirmacaoNaoPendente`, que `src/aurora/api.py` · `_confirmacao_nao_pendente` converte em **409**, e nada executa. O texto do morador sempre entra como `Part(text=...)` em `enviar_texto` e nunca vira resposta de confirmação. Enquanto houver pendência, a mensagem nova nem chega ao modelo (`AVISO_PENDENCIA`).
+
+  [src/aurora/runtime.py#L126-L127](src/aurora/runtime.py#L126-L127)
+  ```python
+  if confirmacao_id not in {p["id"] for p in confirmacoes.pendentes(s)}:
+      raise ConfirmacaoNaoPendente(confirmacao_id)
+  ```
 - `src/aurora/repositorio.py` · `_ja_executada`, `_registrar_execucao`: defesa extra. A aprovação é gravada com a chave `sessão:id da chamada` (`acoes_executadas`), e uma reexecução devolve o resultado anterior em vez de gravar de novo.
 
 **Por que não depende do modelo:** o modelo pode chamar `reservar_area` ou `autorizar_visitante`, mas a tool só grava com `tool_confirmation.confirmed=True`. Esse valor só existe quando o ADK recebe um `FunctionResponse` de `adk_request_confirmation`, e esse `FunctionResponse` só é montado pela rota de confirmações. Escrever "já confirmei" na conversa não produz esse valor.
@@ -75,31 +113,98 @@ Cada garantia abaixo aponta o arquivo e o trecho que a implementam. Todas são v
 ### 2. Cada sessão pertence a um apartamento
 
 - `src/aurora/runtime.py` · `criar_sessao`: o apartamento é gravado **uma única vez**, na criação, no `state` da sessão ADK e na tabela `sessoes` (`repositorio.registrar_sessao`).
+
+  [src/aurora/runtime.py#L63-L69](src/aurora/runtime.py#L63-L69)
+  ```python
+  await self.session_service.create_session(
+      ...
+      state={CHAVE_STATE: apartamento},
+  )
+  repositorio.registrar_sessao(session_id, apartamento)
+  ```
 - `src/aurora/sessao.py` · `apartamento_da_sessao`: é a única forma de as tools obterem o apartamento. Ela exige que o `state` e a tabela `sessoes` coincidam, e se não coincidirem a operação é negada.
-- `src/aurora/tools/reservas.py`, `src/aurora/tools/visitantes.py`: **nenhuma tool tem parâmetro de apartamento**. O validador confere isso no código-fonte.
-- `src/aurora/repositorio.py` · `listar_reservas_ativas`, `cancelar_reserva`, `listar_visitantes`, `area_livre`: toda leitura e escrita filtra `WHERE apartamento = ?`. `cancelar_reserva` responde com uma mensagem genérica quando a reserva não é do apartamento. `area_livre` devolve **só um booleano**, nunca o dono nem o código.
+
+  [src/aurora/sessao.py#L22-L27](src/aurora/sessao.py#L22-L27)
+  ```python
+  def apartamento_da_sessao(tool_context: ToolContext) -> str:
+      do_state = tool_context.state.get(CHAVE_STATE)
+      do_banco = repositorio.apartamento_da_sessao(tool_context.session.id)
+      if not do_state or not do_banco or str(do_state) != do_banco:
+          raise SessaoSemApartamento("Sessão sem apartamento válido; operação negada.")
+      return do_banco
+  ```
+- `src/aurora/tools/reservas.py`, `src/aurora/tools/visitantes.py`: **nenhuma tool tem parâmetro de apartamento**. Todas chamam `apartamento_da_sessao(tool_context)`, e o validador confere isso no código-fonte.
+- `src/aurora/repositorio.py` · `listar_reservas_ativas`, `cancelar_reserva`, `listar_visitantes`: filtram por `WHERE apartamento = ?`. Quando a reserva não é do apartamento, `cancelar_reserva` responde com uma mensagem genérica.
+- `src/aurora/repositorio.py` · `area_livre`: consulta a agenda da área, ou seja, as reservas de todas as unidades, como o enunciado permite. Devolve só `True`/`False`, sem dono nem código.
 
 **Por que não depende do modelo:** o modelo não tem como informar um apartamento, porque esse argumento não existe nas tools. O valor vem de dados gravados pela API antes de qualquer mensagem. Mesmo que o morador diga ser do 302, as consultas continuam filtradas pelo apartamento da sessão, e nenhuma tool devolve dados de outra unidade para entrarem na conversa.
 
 ### 3. Nada se perde no reinício
 
-- `src/aurora/runtime.py` · `DatabaseSessionService`: sessões e eventos ficam em `var/sessoes.db`. Após o reinício, o mesmo `session_id` devolve os mesmos eventos e continua aceitando mensagens. Uma confirmação pendente antes do reinício também pode ser aprovada depois, o que foi testado no validador (WP5).
+- `src/aurora/runtime.py` · `DatabaseSessionService`: sessões e eventos ficam em `var/sessoes.db`. Após o reinício, o mesmo `session_id` devolve os mesmos eventos e continua aceitando mensagens. Uma confirmação pendente antes do reinício também pode ser aprovada depois.
+
+  [src/aurora/runtime.py#L47-L48](src/aurora/runtime.py#L47-L48)
+  ```python
+  self.session_service = DatabaseSessionService(
+      db_url=config.sessoes_db_url(), connect_args={"timeout": 30}
+  ```
 - `src/aurora/db.py` · `init_db`: no startup, só cria o schema e carrega os dados iniciais **se ainda não foram carregados** (`meta.seed_aplicado`). Reiniciar não reseta reservas nem visitantes.
+
+  [src/aurora/db.py#L180-L182](src/aurora/db.py#L180-L182)
+  ```python
+  ja = con.execute("SELECT 1 FROM meta WHERE chave = 'seed_aplicado'").fetchone()
+  if ja:
+      return
+  ```
 
 **Por que não depende do modelo:** a persistência é do runtime e do banco. O modelo não guarda estado entre execuções, e as tools sempre leem o banco.
 
 ### 4. O regulamento é consultado, não carregado
 
 - `src/aurora/agents/coordenador.py` · `AgentTool`: o coordenador não recebe o regulamento nas instruções. Para dúvidas, chama `especialista_regulamento` como `AgentTool`, que o ADK executa numa sessão em memória isolada.
+
+  [src/aurora/agents/coordenador.py#L42-L43](src/aurora/agents/coordenador.py#L42-L43)
+  ```python
+  tools=[AgentTool(agent=especialista_regulamento)],
+  sub_agents=[especialista_reservas, especialista_visitantes],
+  ```
 - `src/aurora/regulamento.py` · `capitulos`, `capitulo`: divide `dados/regulamento.md` por capítulo.
 - `src/aurora/tools/regulamento.py` · `listar_capitulos`, `ler_capitulo`: o especialista vê só os títulos e lê **um** capítulo por vez.
+
+  [src/aurora/tools/regulamento.py#L22-L25](src/aurora/tools/regulamento.py#L22-L25)
+  ```python
+  texto = regulamento.capitulo(int(numero))
+  ...
+  return {"numero": int(numero), "texto": texto}
+  ```
 
 **Por que não depende do modelo:** o texto dos capítulos só existe dentro da sessão isolada do `AgentTool`. Na sessão do morador entram apenas a pergunta e a resposta curta do especialista. Mesmo que ele leia um capítulo a mais, esse texto não chega aos eventos da conversa.
 
 ### 5. Dois moradores, uma reserva
 
 - `src/aurora/db.py` · `ux_reserva_ativa`: índice único parcial `ON reservas (area, data) WHERE status = 'ativa'`. O próprio SQLite recusa uma segunda reserva ativa para a mesma área e data **no instante do INSERT**.
+
+  [src/aurora/db.py#L47-L49](src/aurora/db.py#L47-L49)
+  ```sql
+  -- GARANTIA 5: no máximo uma reserva ATIVA por área e data, garantida na gravação.
+  CREATE UNIQUE INDEX IF NOT EXISTS ux_reserva_ativa
+      ON reservas (area, data) WHERE status = 'ativa';
+  ```
 - `src/aurora/repositorio.py` · `criar_reserva`, `IntegrityError`: a gravação acontece numa transação `BEGIN IMMEDIATE`. Se o índice recusar, a função devolve `{"status": "indisponivel"}`, uma resposta normal que a tool repassa e a API responde com **200**. A conferência feita antes de pedir a confirmação é só para a conversa e não é a garantia.
+
+  [src/aurora/repositorio.py#L126-L149](src/aurora/repositorio.py#L126-L149)
+  ```python
+  with db.transacao() as con:
+      ...
+      con.execute("INSERT INTO codigos_reserva (codigo) VALUES (?)", (codigo,))
+      con.execute(
+          "INSERT INTO reservas (codigo, apartamento, area, data, valor_cobranca, status, criada_em) "
+          ...
+  except sqlite3.IntegrityError as e:
+      ...
+      if "reservas.area" in msg or "reservas.data" in msg:
+          return {"status": "indisponivel", "area": area_id, "data": data}
+  ```
 - `src/aurora/repositorio.py` · `codigos_reserva`: os códigos (`RSV-` + 6 hexadecimais) são registrados numa tabela que nunca é apagada. A chave primária impede reemitir qualquer código, inclusive de reserva cancelada.
 
 **Por que não depende do modelo:** quem decide é a restrição do banco no momento da gravação, não uma checagem feita antes. Num teste com 20 gravações simultâneas, sem o índice saíram 20 reservas; com o índice saiu exatamente 1. O registro está em [VALIDACAO.md](VALIDACAO.md).

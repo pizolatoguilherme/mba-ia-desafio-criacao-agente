@@ -779,6 +779,30 @@ def wp7_referencias() -> None:
         afirmar((RAIZ / link).exists(), f"link quebrado: {link}")
 
 
+RE_TRECHO = re.compile(r"\[(src/[^\]#]+\.py)#L(\d+)-L(\d+)\]\([^)]*\)\s*\n\s*```\w*\n(.*?)\n\s*```", re.DOTALL)
+
+
+@checagem("wp7", "trechos de código da seção Garantias existem nas linhas indicadas (P-05)")
+def wp7_trechos() -> None:
+    texto = (RAIZ / "README.md").read_text(encoding="utf-8")
+    garantias = _secao(texto, "Garantias")
+    for n in range(1, 6):
+        sub = re.search(rf"^### {n}\. .*?(?=^### |\Z)", garantias, re.MULTILINE | re.DOTALL).group(0)
+        afirmar(RE_TRECHO.search(sub), f"Garantia {n} sem trecho de código com link de linhas")
+    total = 0
+    for arq, ini, fim, bloco in RE_TRECHO.findall(garantias):
+        linhas = (RAIZ / arq).read_text(encoding="utf-8").splitlines()
+        ini, fim = int(ini), int(fim)
+        afirmar(1 <= ini <= fim <= len(linhas), f"{arq}#L{ini}-L{fim} fora do arquivo ({len(linhas)} linhas)")
+        intervalo = {l.strip() for l in linhas[ini - 1:fim]}
+        for l in bloco.splitlines():
+            l = l.strip()
+            if l and l != "...":
+                afirmar(l in intervalo, f"{arq}#L{ini}-L{fim}: trecho não encontrado nas linhas: {l!r}")
+        total += 1
+    afirmar(total >= 5, f"só {total} trechos verificáveis")
+
+
 @checagem("wp7", "comandos do README existem no pyproject")
 def wp7_comandos() -> None:
     scripts = tomllib.loads((RAIZ / "pyproject.toml").read_text())["project"]["scripts"]
