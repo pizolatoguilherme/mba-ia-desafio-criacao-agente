@@ -272,6 +272,76 @@ def wp2_normalizacao() -> None:
     afirmar(validar_data("20/04/2030") is None and validar_data("2030-02-30") is None, "data inválida aceita")
 
 
+# --------------------------------------------------------------------------- #
+# WP3 — regulamento
+# --------------------------------------------------------------------------- #
+
+
+def ancoras_de_outros_capitulos(exceto: int) -> list[str]:
+    """Título e frases longas de cada capítulo diferente de `exceto` (detector da Garantia 4)."""
+    from aurora import regulamento as rg
+
+    ancoras = []
+    for c in rg.capitulos():
+        if c["numero"] == exceto:
+            continue
+        ancoras.append(c["titulo"])  # ex.: "Capítulo VIII: Animais de estimação"
+        texto = rg.capitulo(c["numero"])
+        frases = [f.strip(" *") for f in re.split(r"(?<=[.;:])\s+", texto) if len(f) > 80]
+        ancoras += [f[:60] for f in frases[:: max(1, len(frases) // 4)]][:4]
+    return ancoras
+
+
+@checagem("wp3", "regulamento dividido em 14 capítulos, cobrindo o arquivo inteiro")
+def wp3_parser() -> None:
+    from aurora import regulamento as rg
+
+    caps = rg.capitulos()
+    afirmar([c["numero"] for c in caps] == list(range(1, 15)), f"numeração: {caps}")
+    afirmar(caps[3]["titulo"] == "Capítulo IV: Piscina", f"cap IV: {caps[3]}")
+    texto = (RAIZ / "dados" / "regulamento.md").read_text(encoding="utf-8")
+    soma = sum(len(rg.capitulo(c["numero"])) for c in caps)
+    afirmar(soma > len(texto) * 0.95, "capítulos não cobrem o arquivo")
+    afirmar(rg.capitulo(99) is None, "capítulo inexistente devolveu texto")
+
+
+@checagem("wp3", "ler_capitulo(4) traz o horário de domingo e nada de outros capítulos")
+def wp3_capitulo_piscina() -> None:
+    from aurora.tools.regulamento import ler_capitulo, listar_capitulos
+
+    t = ler_capitulo(4)["texto"]
+    afirmar("Aos domingos e feriados, a piscina funciona das 9h às 20h" in t, "horário ausente")
+    vazou = [a for a in ancoras_de_outros_capitulos(4) if a in t]
+    afirmar(not vazou, f"capítulo 4 contém trechos de outros: {vazou[:3]}")
+    afirmar("erro" in ler_capitulo(0), "capítulo 0 aceito")
+    afirmar(all("texto" not in c for c in listar_capitulos()["capitulos"]), "índice traz texto")
+
+
+@checagem("wp3", "especialista de regulamento sozinho responde 20h (piscina, domingo)", requer="llm")
+def wp3_especialista_llm() -> None:
+    import asyncio
+
+    from google.adk.runners import InMemoryRunner
+    from google.genai import types
+
+    from aurora.agents.regulamento import especialista_regulamento
+
+    async def rodar() -> str:
+        runner = InMemoryRunner(agent=especialista_regulamento, app_name="validar")
+        s = await runner.session_service.create_session(app_name="validar", user_id="u")
+        texto = ""
+        async for ev in runner.run_async(
+            user_id="u", session_id=s.id,
+            new_message=types.Content(role="user", parts=[types.Part(text="Até que horas a piscina funciona aos domingos?")]),
+        ):
+            if ev.content and ev.content.parts:
+                texto += "".join(p.text or "" for p in ev.content.parts if not p.thought)
+        return texto
+
+    resp = asyncio.run(rodar())
+    afirmar(re.search(r"\b20\s?h", resp) is not None, f"resposta sem 20h: {resp!r}")
+
+
 ORDEM = ["wp0", "wp1", "wp2", "wp3", "wp4", "wp5", "wp6", "wp7", "wp8"]
 
 
