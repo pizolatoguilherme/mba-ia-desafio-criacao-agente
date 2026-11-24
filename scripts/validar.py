@@ -85,7 +85,8 @@ def inv_segredos() -> None:
 def inv_adk() -> None:
     proj = tomllib.loads((RAIZ / "pyproject.toml").read_text())
     deps = proj["project"]["dependencies"]
-    afirmar("google-adk==2.9.1" in deps, f"google-adk não fixado: {deps}")
+    afirmar(any(re.fullmatch(r"google-adk(\[[\w,]+\])?==2\.9\.1", d) for d in deps),
+            f"google-adk não fixado em ==2.9.1: {deps}")
     lock = (RAIZ / "uv.lock").read_text()
     afirmar(re.search(r'name = "google-adk"\nversion = "2\.9\.1"', lock) is not None,
             "uv.lock sem google-adk 2.9.1")
