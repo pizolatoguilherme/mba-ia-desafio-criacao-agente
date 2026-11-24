@@ -145,6 +145,133 @@ def wp0_arquivos() -> None:
     afirmar(sh("git", "check-ignore", "var/x", ok=False).returncode == 0, "var/ não ignorado")
 
 
+# --------------------------------------------------------------------------- #
+# WP2 — camada de dados (banco temporário isolado, ver TMP_VAR)
+# --------------------------------------------------------------------------- #
+
+import json  # noqa: E402
+import os  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+
+TMP_VAR = Path(tempfile.mkdtemp(prefix="aurora-validar-"))
+os.environ["AURORA_DB"] = str(TMP_VAR / "aurora.db")
+os.environ["SESSOES_DB"] = str(TMP_VAR / "sessoes.db")
+
+
+def _dados(nome: str) -> list[dict]:
+    return json.loads((RAIZ / "dados" / nome).read_text(encoding="utf-8"))
+
+
+@checagem("wp2", "aurora-restaurar num var/ vazio cria o banco com os dados iniciais")
+def wp2_restaurar_vazio() -> None:
+    (TMP_VAR / "sessoes.db").write_text("lixo")  # restauração deve apagar sessões
+    sh("uv", "run", "aurora-restaurar")
+    afirmar(not (TMP_VAR / "sessoes.db").exists(), "sessoes.db não foi apagado")
+    from aurora import repositorio as rp
+
+    for r in _dados("reservas.json"):
+        ativas = rp.listar_reservas_ativas(r["apartamento"])
+        afirmar({"codigo": r["codigo"], "area": r["area"], "data": r["data"]} in ativas,
+                f"reserva inicial ausente: {r}")
+    for v in _dados("visitantes.json"):
+        afirmar({"nome": v["nome"], "data": v["data"]} in rp.listar_visitantes(v["apartamento"]),
+                f"visitante inicial ausente: {v}")
+    afirmar(rp.listar_reservas_ativas("101") == [{"codigo": "RSV-1377", "area": "quadra", "data": "2030-03-09"}],
+            "101 deveria ter só RSV-1377")
+    afirmar(len(rp.listar_areas()) == 3, "áreas não carregadas")
+
+
+@checagem("wp2", "cancelar só a própria reserva, sem revelar reservas alheias")
+def wp2_cancelar() -> None:
+    from aurora import repositorio as rp
+
+    r = rp.cancelar_reserva("101", area_id="salao-de-festas", data="2030-03-16")
+    afirmar(r["status"] == "nao_encontrada", f"101 cancelou reserva alheia: {r}")
+    afirmar("RSV-4821" not in json.dumps(r) and "302" not in json.dumps(r), f"vazou dado alheio: {r}")
+    afirmar(any(x["codigo"] == "RSV-4821" for x in rp.listar_reservas_ativas("302")), "RSV-4821 sumiu")
+    r = rp.cancelar_reserva("101", codigo="RSV-4821")
+    afirmar(r["status"] == "nao_encontrada", f"101 cancelou RSV-4821 por código: {r}")
+    r = rp.cancelar_reserva("101", area_id="quadra", data="2030-03-09")
+    afirmar(r["status"] == "cancelada", f"não cancelou a própria: {r}")
+    afirmar(rp.listar_reservas_ativas("101") == [], "RSV-1377 ainda ativa")
+
+
+@checagem("wp2", "área ocupada só informa livre/ocupada; cancelada libera a data")
+def wp2_disponibilidade() -> None:
+    from aurora import repositorio as rp
+
+    afirmar(rp.area_livre("salao-de-festas", "2030-03-16") is False, "data do 302 deveria estar ocupada")
+    afirmar(rp.area_livre("quadra", "2030-03-09") is True, "data cancelada deveria estar livre")
+    r = rp.criar_reserva("101", "quadra", "2030-03-09")
+    afirmar(r["status"] == "reservado" and r["valor_cobranca"] is None, f"recriar após cancelar falhou: {r}")
+    r2 = rp.criar_reserva("201", "salao-de-festas", "2030-03-16")
+    afirmar(r2 == {"status": "indisponivel", "area": "salao-de-festas", "data": "2030-03-16"},
+            f"reserva duplicada ou resposta com dado alheio: {r2}")
+    r3 = rp.criar_reserva("101", "churrasqueira", "2030-06-01")
+    afirmar(r3["valor_cobranca"] == 80.0, f"cobrança não registrada: {r3}")
+
+
+@checagem("wp2", "20 gravações simultâneas na mesma área/data = exatamente 1 reserva, sem exceção")
+def wp2_concorrencia() -> None:
+    from aurora import db, repositorio as rp
+
+    resultados: list = []
+    erros: list = []
+    barreira = threading.Barrier(20)
+
+    def tentar(i: int) -> None:
+        try:
+            barreira.wait()
+            resultados.append(rp.criar_reserva(str(100 + i), "salao-de-festas", "2030-05-11"))
+        except Exception as e:  # noqa: BLE001
+            erros.append(repr(e))
+
+    ts = [threading.Thread(target=tentar, args=(i,)) for i in range(20)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    afirmar(not erros, f"exceções vazaram: {erros[:3]}")
+    ok = [r for r in resultados if r["status"] == "reservado"]
+    afirmar(len(ok) == 1, f"{len(ok)} reservas criadas")
+    with db.leitura() as con:
+        n = con.execute("SELECT COUNT(*) FROM reservas WHERE area='salao-de-festas' AND data='2030-05-11' "
+                        "AND status='ativa'").fetchone()[0]
+    afirmar(n == 1, f"{n} reservas ativas no banco")
+
+
+@checagem("wp2", "códigos nunca repetem, nem após restaurar; reinício (init_db) não reseta nada")
+def wp2_codigos_e_reinicio() -> None:
+    from aurora import db, repositorio as rp
+
+    with db.leitura() as con:
+        emitidos = {r[0] for r in con.execute("SELECT codigo FROM codigos_reserva")}
+    rp.autorizar_visitante("101", "Teste Reinicio", "2030-07-01")
+    db.init_db()  # simula novo startup da API
+    afirmar({"nome": "Teste Reinicio", "data": "2030-07-01"} in rp.listar_visitantes("101"),
+            "init_db apagou dados gravados")
+    sh("uv", "run", "aurora-restaurar")
+    with db.leitura() as con:
+        depois = {r[0] for r in con.execute("SELECT codigo FROM codigos_reserva")}
+    afirmar(emitidos <= depois, "restauração apagou códigos emitidos")
+    novos = {rp.criar_reserva("101", "churrasqueira", f"2031-01-{d:02d}")["codigo"] for d in range(1, 21)}
+    afirmar(len(novos) == 20 and not (novos & emitidos), "código repetido")
+    afirmar(rp.listar_reservas_ativas("101")[0]["codigo"] == "RSV-1377", "restauração não voltou RSV-1377")
+    sh("uv", "run", "aurora-restaurar")
+
+
+@checagem("wp2", "normalização de área e data")
+def wp2_normalizacao() -> None:
+    from aurora.normalizacao import normalizar_area, validar_data
+
+    casos = {"Salão de festas": "salao-de-festas", "salao-de-festas": "salao-de-festas",
+             "quadra": "quadra", "Quadra poliesportiva": "quadra", "churrasqueira": "churrasqueira",
+             "piscina": None, "": None}
+    for entrada, esperado in casos.items():
+        afirmar(normalizar_area(entrada) == esperado, f"normalizar_area({entrada!r}) != {esperado}")
+    afirmar(validar_data("2030-04-20") == "2030-04-20", "data válida rejeitada")
+    afirmar(validar_data("20/04/2030") is None and validar_data("2030-02-30") is None, "data inválida aceita")
+
+
 ORDEM = ["wp0", "wp1", "wp2", "wp3", "wp4", "wp5", "wp6", "wp7", "wp8"]
 
 

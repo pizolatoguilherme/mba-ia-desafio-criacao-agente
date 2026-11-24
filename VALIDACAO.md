@@ -6,3 +6,4 @@ incluindo a regressão das etapas anteriores e os invariantes globais.
 | Data | WP | Comando | Resultado | Notas / decisões |
 |---|---|---|---|---|
 | 2026-11-24 | WP0 | `uv run python scripts/validar.py --ate wp0` | OK (8/8) | Fork público criado; layout `src/aurora` (padrão do `uv init --package`); `google-adk==2.9.1`; teste negativo confirmou falha com `.env.example` preenchido. |
+| 2026-11-24 | WP2 | `uv run python scripts/validar.py --ate wp2` | OK (14/14, regressão WP0 + invariantes) | Banco de validação isolado em diretório temporário. Teste negativo: sem o índice `ux_reserva_ativa`, 20 threads com checagem prévia criaram 20 reservas; com o índice, exatamente 1. Restauração apaga sessões e preserva `codigos_reserva`. |
