@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import signal
 import socket
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -110,6 +112,29 @@ def _socket_loopback(familia: socket.AddressFamily, endereco: str) -> socket.soc
     return s
 
 
+class _Servidor(uvicorn.Server):
+    """uvicorn.Server que ignora um Ctrl+C duplicado logo após o primeiro.
+
+    O Ctrl+C entrega SIGINT ao grupo de processos (uv + python), e o sinal pode
+    chegar duas vezes em poucos milissegundos. No uvicorn, um segundo SIGINT
+    durante o encerramento força a saída e pula o shutdown do lifespan. Aqui, um
+    SIGINT repetido dentro de JANELA segundos é ignorado; um segundo Ctrl+C
+    intencional, depois disso, continua forçando a saída.
+    """
+
+    JANELA = 1.0
+    _primeiro_sigint: float | None = None
+
+    def handle_exit(self, sig: int, frame) -> None:
+        if sig == signal.SIGINT:
+            agora = time.monotonic()
+            if self._primeiro_sigint is not None and agora - self._primeiro_sigint < self.JANELA:
+                return
+            if self._primeiro_sigint is None:
+                self._primeiro_sigint = agora
+        super().handle_exit(sig, frame)
+
+
 def main() -> None:
     """Sobe a API em http://localhost:8000, escutando em 127.0.0.1 e em ::1.
 
@@ -121,7 +146,7 @@ def main() -> None:
         sockets.append(_socket_loopback(socket.AF_INET6, "::1"))
     except OSError as e:  # máquina sem IPv6: segue só com IPv4
         logging.getLogger("aurora.api").warning("IPv6 de loopback indisponível (%s); só 127.0.0.1", e)
-    servidor = uvicorn.Server(uvicorn.Config("aurora.api:app", port=PORTA, workers=1))
+    servidor = _Servidor(uvicorn.Config("aurora.api:app", port=PORTA, workers=1))
     try:
         servidor.run(sockets=sockets)
     except KeyboardInterrupt:  # Ctrl+C: encerramento normal (como em uvicorn.run)

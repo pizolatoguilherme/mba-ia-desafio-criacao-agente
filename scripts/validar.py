@@ -148,6 +148,22 @@ def inv_tools_de_dados_usam_sessao() -> None:
                 f"tool {nome} acessa dados de apartamento sem apartamento_da_sessao(tool_context)")
 
 
+@checagem("inv", "tools, API e agentes não acessam o banco por fora do repositorio (P-08)")
+def inv_acesso_via_repositorio() -> None:
+    alvos = [SRC / "api.py", *(SRC / "tools").glob("*.py"), *(SRC / "agents").glob("*.py")]
+    for arq in alvos:
+        if not arq.exists():
+            continue
+        for no in ast.walk(ast.parse(arq.read_text(encoding="utf-8"))):
+            nomes = []
+            if isinstance(no, ast.ImportFrom):
+                nomes = [a.name for a in no.names] + [no.module or ""]
+            elif isinstance(no, ast.Import):
+                nomes = [a.name for a in no.names]
+            afirmar(not any(n in ("db", "aurora.db", "sqlite3") or n.endswith(".db") for n in nomes),
+                    f"{arq.relative_to(RAIZ)} importa o banco diretamente: {nomes}")
+
+
 @checagem("inv", "instruções dos agentes sem referência a artigo concreto do regulamento")
 def inv_sem_artigo_concreto() -> None:
     pasta = SRC / "agents"
@@ -599,6 +615,7 @@ import time  # noqa: E402
 
 BASE = "http://localhost:8000"
 _API: subprocess.Popen | None = None
+_API_LOG_INICIO = 0
 
 
 def _porta_ocupada() -> bool:
@@ -610,6 +627,8 @@ def api_subir(cwd: Path | None = None, env: dict | None = None) -> None:
     global _API
     afirmar(_API is None, "API já está no ar")
     afirmar(not _porta_ocupada(), "porta 8000 ocupada por outro processo; pare-o antes de validar")
+    global _API_LOG_INICIO
+    _API_LOG_INICIO = (TMP_VAR / "api.log").stat().st_size if (TMP_VAR / "api.log").exists() else 0
     log = open(TMP_VAR / "api.log", "a")
     # Grupo de processos próprio: o "Ctrl+C" abaixo vai para o grupo inteiro, como no terminal.
     _API = subprocess.Popen(["uv", "run", "aurora-api"], cwd=cwd or RAIZ, env=env,
@@ -622,12 +641,21 @@ def api_subir(cwd: Path | None = None, env: dict | None = None) -> None:
     raise Falha("API não subiu em 60s")
 
 
-def api_parar() -> None:
-    """Equivale ao Ctrl+C: SIGINT e espera o encerramento."""
+def api_parar(duplicado: float | None = None) -> None:
+    """Equivale ao Ctrl+C: SIGINT ao grupo e espera o encerramento, que precisa ser limpo.
+
+    `duplicado`: manda um segundo SIGINT após N segundos (Ctrl+C entregue duas vezes, P-09).
+    """
     global _API
     if _API is None:
         return
     os.killpg(_API.pid, signal.SIGINT)  # Ctrl+C: SIGINT ao grupo (uv + python)
+    if duplicado is not None:
+        time.sleep(duplicado)
+        try:
+            os.killpg(_API.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
     try:
         _API.wait(timeout=30)
     except subprocess.TimeoutExpired:
@@ -637,8 +665,14 @@ def api_parar() -> None:
     _API = None
     for _ in range(40):
         if not _porta_ocupada():
-            return
+            break
         time.sleep(0.25)
+    # P-09: todo Ctrl+C precisa passar pelo shutdown do lifespan, sem traceback
+    with open(TMP_VAR / "api.log", encoding="utf-8", errors="replace") as f:
+        f.seek(_API_LOG_INICIO)
+        trecho = f.read()
+    afirmar("Application shutdown complete" in trecho and "Traceback" not in trecho,
+            f"encerramento por Ctrl+C não foi limpo; veja {TMP_VAR / 'api.log'}:\n{trecho[-800:]}")
 
 
 def cliente():
@@ -684,6 +718,31 @@ def wp5_contrato() -> None:
             afirmar(r.status_code == 200, f"{url}: {r.status_code}")
     finally:
         api_parar()
+
+
+@checagem("wp5", "Ctrl+C duplicado em menos de 1s é ignorado; um 2º Ctrl+C intencional depois força a saída (P-09)")
+def wp5_ctrlc_logica() -> None:
+    import signal as _sig
+
+    import uvicorn
+
+    from aurora.api import _Servidor
+
+    srv = _Servidor(uvicorn.Config("aurora.api:app"))
+    srv.handle_exit(_sig.SIGINT, None)
+    srv.handle_exit(_sig.SIGINT, None)  # duplicado imediato
+    afirmar(srv.should_exit and not srv.force_exit, "SIGINT duplicado forçou a saída")
+    srv._primeiro_sigint -= srv.JANELA + 0.1  # simula 2º Ctrl+C intencional depois da janela
+    srv.handle_exit(_sig.SIGINT, None)
+    afirmar(srv.force_exit, "2º Ctrl+C intencional não forçou a saída")
+
+
+@checagem("wp5", "API real: Ctrl+C entregue duas vezes (10 ms) e 5 ciclos simples encerram limpos (P-09)", requer="api")
+def wp5_ctrlc_real() -> None:
+    sh("uv", "run", "aurora-restaurar")
+    for duplicado in (0.01, 0.05, None, None, None, None, None):
+        api_subir()
+        api_parar(duplicado=duplicado)  # api_parar exige "Application shutdown complete" e nenhum traceback
 
 
 @checagem("wp5", "pendência sobrevive ao reinício; aprovar depois executa 1x; reenvio 409; eventos preservados",

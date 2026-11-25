@@ -47,7 +47,7 @@ A topologia e a configuração do `App` foram decididas por um spike ([scripts/s
 
 Tudo é SQLite, em dois arquivos dentro de `var/` (fora do Git). Não há serviço externo para subir.
 
-- `var/aurora.db` guarda o domínio: áreas, apartamentos, reservas, visitantes, o dono de cada sessão e os códigos já emitidos. O schema está em [src/aurora/db.py](src/aurora/db.py) e o acesso só passa por [src/aurora/repositorio.py](src/aurora/repositorio.py).
+- `var/aurora.db` guarda o domínio: áreas, apartamentos, reservas, visitantes, o dono de cada sessão e os códigos já emitidos. O schema, a carga inicial (`init_db`, no startup da API) e a restauração (`restaurar_dados`) estão em [src/aurora/db.py](src/aurora/db.py). Durante a conversa, todo acesso aos dados (tools e rotas de verificação) passa por [src/aurora/repositorio.py](src/aurora/repositorio.py). Tools, API e agentes não importam o banco diretamente, e o validador confere isso.
 - `var/sessoes.db` guarda as sessões e os eventos do ADK, via `DatabaseSessionService` com `sqlite+aiosqlite`.
 
 Os arquivos de `dados/` são só lidos. A primeira subida da API carrega os dados iniciais, e o comando de restauração volta reservas e visitantes ao estado desses arquivos. **A restauração também apaga as sessões**, para que cada avaliação comece limpa. Os códigos de reserva já emitidos continuam registrados mesmo após restaurar, para nunca se repetirem.
